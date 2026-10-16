@@ -63,6 +63,10 @@ class DB:
         self.conn.execute("INSERT OR REPLACE INTO settings VALUES (?, ?, ?)", (uid, key, value))
         self.conn.commit()
 
+    def del_setting(self, uid, key):
+        self.conn.execute("DELETE FROM settings WHERE user_id = ? AND key = ?", (uid, key))
+        self.conn.commit()
+
     # file_id cache (resend without download/upload)
     def cache_get(self, chat_ref, msg_id):
         return self.conn.execute(

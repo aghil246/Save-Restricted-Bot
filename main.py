@@ -115,6 +115,7 @@ class Job:
     specs: list
     cancelled: bool = False
     bin: bool = False
+    bin_err: bool = False
     status: object = field(default=None, repr=False)
 
 
@@ -152,14 +153,75 @@ def clean_markup(msg):
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+awaiting_bin: set = set()  # owner ids currently expected to send a BIN channel
+last_owner_alert = None
+
+
+def bin_channel():
+    """Effective BIN channel: the one the admin set in the bot, else BIN_CHANNEL from config."""
+    v = db.get_setting(0, "bin_channel")
+    return int(v) if v else BIN_CHANNEL
+
+
+def bin_reason(e):
+    """Human-readable reason for a Telegram error when talking to the BIN channel."""
+    code = str(getattr(e, "ID", "") or type(e).__name__).upper()
+    if any(x in code for x in ("ADMIN_REQUIRED", "WRITE_FORBIDDEN", "SEND_", "RIGHTS", "FORBIDDEN", "NOT_ALLOWED")):
+        return "the bot is not an admin with the “Post Messages” permission in the BIN channel"
+    if any(x in code for x in ("CHANNEL_PRIVATE", "NOT_PARTICIPANT", "CHANNEL_INVALID", "PEER_ID_INVALID",
+                               "CHAT_ID_INVALID", "CHAT_INVALID")):
+        return "the bot is not a member of that chat (or the ID is wrong)"
+    if "USERNAME" in code:
+        return "that username does not exist"
+    return f"unexpected error: {e}"
+
+
+async def check_bin(cid):
+    """Return None if the bot can post in the chat, else the reason it can't."""
+    try:
+        me = await bot.get_chat_member(cid, "me")
+    except RPCError as e:
+        return bin_reason(e)
+    status = str(getattr(me, "status", "")).upper()
+    if "OWNER" in status:
+        return None
+    if "ADMIN" not in status:
+        return "the bot is not an admin in the BIN channel (add it as admin with “Post Messages”)"
+    priv = getattr(me, "privileges", None)
+    if priv is not None and getattr(priv, "can_post_messages", True) is False:
+        return "the bot is an admin but lacks the “Post Messages” permission"
+    return None
+
+
+async def alert_owner(text):
+    """Message the owner, at most once per 10 minutes."""
+    global last_owner_alert
+    if last_owner_alert is not None and time.monotonic() - last_owner_alert < 600:
+        return
+    last_owner_alert = time.monotonic()
+    try:
+        await bot.send_message(OWNER, text)
+    except Exception:
+        pass
+
+
 async def to_bin(job, sent, mk=None):
     """Copy a delivered message to the bin channel. Never raises."""
-    if not BIN_CHANNEL or not job.bin or sent is None:
+    cid = bin_channel()
+    if not cid or not job.bin or sent is None:
         return
     try:
-        await sent.copy(BIN_CHANNEL, reply_markup=mk)  # sent msgs lack the markup, pass it explicitly
+        await sent.copy(cid, reply_markup=mk)  # sent msgs lack the markup, pass it explicitly
     except Exception as e:
+        reason = bin_reason(e)
         log.warning("bin channel copy failed: %s", e)
+        if not job.bin_err:  # tell the user once per job, and the owner (throttled)
+            job.bin_err = True
+            try:
+                await bot.send_message(job.chat_id, f"⚠️ **BIN copy failed**: __{reason}__", **rp(job.reply_id))
+            except Exception:
+                pass
+            await alert_owner(f"⚠️ **BIN channel problem**: __{reason}__\n\nFix it, or set another channel in /settings.")
 
 
 def human(n):
@@ -207,43 +269,115 @@ async def start(_, m):
 
 # ---------- settings ----------
 BIN_LABELS = {"off": "Off", "on": "Always on", "ask": "Ask each time"}
+SET_RE = r"^set:(bin:(?:off|on|ask)|close|binset|binrm|bincancel)$"
 
 
 def settings_view(uid):
-    close = [InlineKeyboardButton("✖️ Close", callback_data="set:close")]
-    if not BIN_CHANNEL:
-        return "**⚙️ Settings**\n\n__Nothing to configure (BIN_CHANNEL is not set).__", InlineKeyboardMarkup([close])
-    cur = db.get_setting(uid, "bin", "off")
-    rows = [[InlineKeyboardButton(("✅ " if k == cur else "") + v, callback_data=f"set:bin:{k}")]
-            for k, v in BIN_LABELS.items()]
-    text = (f"**⚙️ Settings**\n\n**Copy to BIN channel**: {BIN_LABELS[cur]}\n"
-            "__Whether results are also copied to the BIN channel. \"Ask each time\" shows a Yes/No prompt per job.__")
-    return text, InlineKeyboardMarkup(rows + [close])
+    cid = bin_channel()
+    is_owner = uid == OWNER
+    rows = []
+    if cid:
+        cur = db.get_setting(uid, "bin", "off")
+        title = db.get_setting(0, "bin_title") if db.get_setting(0, "bin_channel") else None
+        title = "".join(ch for ch in (title or "") if ch not in "*_`[]")
+        label = f"{title} (`{cid}`)" if title else f"`{cid}`"
+        text = (f"**⚙️ Settings**\n\n**BIN channel**: {label}\n**Copy to BIN channel**: {BIN_LABELS[cur]}\n"
+                "__Whether results are also copied to the BIN channel. \"Ask each time\" shows a Yes/No prompt per job.__")
+        rows += [[InlineKeyboardButton(("✅ " if k == cur else "") + v, callback_data=f"set:bin:{k}")]
+                 for k, v in BIN_LABELS.items()]
+    else:
+        text = "**⚙️ Settings**\n\n**BIN channel**: not set" + ("" if is_owner else "\n__Ask the admin to set one.__")
+    if is_owner:
+        rows.append([InlineKeyboardButton("📡 Change BIN channel" if cid else "📡 Set BIN channel", callback_data="set:binset")])
+        if db.get_setting(0, "bin_channel") is not None:
+            rows.append([InlineKeyboardButton("🗑 Remove BIN channel", callback_data="set:binrm")])
+    rows.append([InlineKeyboardButton("✖️ Close", callback_data="set:close")])
+    return text, InlineKeyboardMarkup(rows)
 
 
 @bot.on_message(filters.private & filters.command("settings"))
 async def settings(_, m):
     if not allowed(m.from_user.id):
         return await m.reply(f"**Not authorized.** Your ID: `{m.from_user.id}`", quote=True)
+    awaiting_bin.discard(m.from_user.id)
     text, mk = settings_view(m.from_user.id)
     await m.reply(text, reply_markup=mk, quote=True)
 
 
-@bot.on_callback_query(filters.regex(r"^set:(bin:(?:off|on|ask)|close)$"))
+@bot.on_callback_query(filters.regex(SET_RE))
 async def on_settings(_, q):
-    if not allowed(q.from_user.id):
+    uid = q.from_user.id
+    if not allowed(uid):
         return await q.answer("Not authorized", show_alert=True)
     data = q.matches[0].group(1)
     if data == "close":
+        awaiting_bin.discard(uid)
         await q.answer()
         return await q.message.delete()
-    db.set_setting(q.from_user.id, "bin", data.split(":")[1])
-    text, mk = settings_view(q.from_user.id)
+    if data in ("binset", "binrm") and uid != OWNER:
+        return await q.answer("Admin only", show_alert=True)
+
+    if data == "binset":
+        awaiting_bin.add(uid)
+        await q.message.edit_text(
+            "**📡 Set BIN channel**\n\n1. Add me to the channel as **admin** with the **Post Messages** permission.\n"
+            "2. Send the channel ID (`-100…`) or @username here, or forward any message from the channel.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="set:bincancel")]]))
+        return await q.answer()
+    if data == "bincancel":
+        awaiting_bin.discard(uid)
+    elif data == "binrm":
+        db.del_setting(0, "bin_channel")
+        db.del_setting(0, "bin_title")
+    else:
+        db.set_setting(uid, "bin", data.split(":")[1])
+
+    text, mk = settings_view(uid)
     try:
         await q.message.edit_text(text, reply_markup=mk)
     except RPCError:
         pass  # message not modified
-    await q.answer("Saved")
+    await q.answer("Saved" if data not in ("bincancel",) else None)
+
+
+async def handle_bin_input(m):
+    chat = getattr(m, "forward_from_chat", None) or getattr(getattr(m, "forward_origin", None), "chat", None)
+    target = chat.id if chat else None
+    if target is None:
+        t = (m.text or "").strip()
+        if re.fullmatch(r"-?\d+", t):
+            target = int(t) if t.startswith("-100") else int("-100" + t.lstrip("-"))
+        else:
+            u = re.sub(r"^(?:https?://)?t\.me/", "", t).lstrip("@")
+            if re.fullmatch(r"\w{4,}", u):
+                target = u
+    if target is None:
+        return await m.reply("Send the channel ID (`-100…`), its @username, or forward a message from it.", quote=True)
+
+    try:
+        c = await bot.get_chat(target)
+    except RPCError as e:
+        return await m.reply(f"❌ **Can't access that chat**: __{bin_reason(e)}__\n\nAdd me as admin, then send it again.", quote=True)
+    if not any(x in str(c.type).upper() for x in ("CHANNEL", "GROUP")):
+        return await m.reply("❌ That is not a channel or group. Send a channel.", quote=True)
+
+    reason = await check_bin(c.id)
+    if reason:
+        return await m.reply(f"❌ **Can't use `{c.title}`**: __{reason}__\n\nFix it, then send the channel again.", quote=True)
+    try:  # the real test: post and remove a message
+        t = await bot.send_message(c.id, "✅ BIN channel connected")
+        try:
+            await t.delete()
+        except RPCError:
+            pass
+    except Exception as e:
+        return await m.reply(f"❌ **Can't post in `{c.title}`**: __{bin_reason(e)}__\n\nFix it, then send the channel again.", quote=True)
+
+    db.set_setting(0, "bin_channel", str(c.id))
+    db.set_setting(0, "bin_title", c.title or "")
+    awaiting_bin.discard(m.from_user.id)
+    text, mk = settings_view(m.from_user.id)
+    await m.reply("✅ **BIN channel saved.**\n\n" + text, reply_markup=mk, quote=True)
 
 
 @bot.on_callback_query(filters.regex("^noop$"))
@@ -312,6 +446,14 @@ async def stats(_, m):
 CMDS = ["start", "settings", "cancel", "adduser", "deluser", "users", "stats"]
 
 
+@bot.on_message(filters.private & (filters.text | filters.forwarded) & ~filters.command(CMDS), group=-1)
+async def bin_input(_, m):
+    if not m.from_user or m.from_user.id != OWNER or OWNER not in awaiting_bin:
+        return  # not waiting for a channel: fall through to the normal handler
+    await handle_bin_input(m)
+    m.stop_propagation()
+
+
 @bot.on_message(filters.private & filters.text & ~filters.command(CMDS))
 async def on_text(_, m):
     uid = m.from_user.id
@@ -338,7 +480,7 @@ async def on_text(_, m):
     if len(jobs_by_user.get(uid, [])) >= MAX_PER_USER:
         return await m.reply(f"**Too many pending jobs** (max {MAX_PER_USER}). Use /cancel", quote=True)
 
-    mode = db.get_setting(uid, "bin", "off") if BIN_CHANNEL else "off"
+    mode = db.get_setting(uid, "bin", "off") if bin_channel() else "off"
     if mode == "ask":  # ask before queueing
         now = time.monotonic()
         for k in [k for k, v in pending.items() if now - v[4] > 600]:
@@ -592,11 +734,12 @@ async def main():
             scope=BotCommandScopeChat(OWNER))
     except Exception as e:
         log.warning("could not set bot commands: %s", e)
-    if BIN_CHANNEL:
-        try:
-            await bot.get_chat(BIN_CHANNEL)
-        except Exception as e:
-            log.warning("BIN_CHANNEL %s not reachable (add the bot as channel admin): %s", BIN_CHANNEL, e)
+    cid = bin_channel()
+    if cid:
+        reason = await check_bin(cid)
+        if reason:
+            log.warning("BIN channel %s unusable: %s", cid, reason)
+            await alert_owner(f"⚠️ **BIN channel problem**: __{reason}__\n\nSet it again in /settings.")
     if acc:
         await acc.start()
     tasks = [asyncio.create_task(worker()) for _ in range(WORKERS)]
