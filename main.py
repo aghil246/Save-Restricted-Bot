@@ -119,6 +119,16 @@ def allowed(uid):
     return uid == OWNER or db.is_user(uid)
 
 
+def clean_markup(msg):
+    """Keep only URL buttons of an inline keyboard (callback/other buttons can't work through this bot)."""
+    mk = getattr(msg, "reply_markup", None)
+    if not isinstance(mk, InlineKeyboardMarkup):
+        return None
+    rows = [[InlineKeyboardButton(b.text, url=b.url) for b in row if b.url] for row in mk.inline_keyboard]
+    rows = [r for r in rows if r]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 async def to_bin(sent):
     """Copy a delivered message to the bin channel. Never raises."""
     if not BIN_CHANNEL or sent is None:
@@ -352,7 +362,8 @@ async def process_one(job, kind, ref, msg_id):
     # public chats without protection: plain copy, no account needed
     if kind is None:
         try:
-            sent = await bot.copy_message(job.chat_id, chat, msg_id, reply_to_message_id=rid)
+            orig = await bot.get_messages(chat, msg_id)
+            sent = await orig.copy(job.chat_id, reply_to_message_id=rid, reply_markup=clean_markup(orig))
             await to_bin(sent)
             return "copied"
         except (UsernameNotOccupied, UsernameInvalid):
@@ -376,7 +387,8 @@ async def process_one(job, kind, ref, msg_id):
 
     if msg.text:
         sent = await bot.send_message(job.chat_id, msg.text.html, parse_mode=ParseMode.HTML,
-                                      disable_web_page_preview=True, reply_to_message_id=rid)
+                                      disable_web_page_preview=True, reply_to_message_id=rid,
+                                      reply_markup=clean_markup(msg))
         await to_bin(sent)
         return "downloaded"
 
@@ -412,7 +424,9 @@ async def transfer(job, msg, mkind, chat_ref):
         if cap_html and len(msg.caption) > 1024:  # bot caption limit
             extra, cap_html = cap_html, None
         cap = dict(caption=cap_html, parse_mode=ParseMode.HTML)
-        base = dict(reply_to_message_id=job.reply_id, progress=make_progress(bot, job, "Uploading"))
+        mk = clean_markup(msg)
+        base = dict(reply_to_message_id=job.reply_id, reply_markup=mk,
+                    progress=make_progress(bot, job, "Uploading"))
         cid = job.chat_id
 
         if mkind == "document":
@@ -445,7 +459,7 @@ async def transfer(job, msg, mkind, chat_ref):
             await to_bin(sent_extra)
 
         sent_media = getattr(sent, mkind, None)
-        if sent_media and not extra:  # long-caption posts need the follow-up message, so don't cache
+        if sent_media and not extra and not mk:  # long captions / buttons aren't stored in the cache
             db.cache_put(chat_ref, msg.id, mkind, sent_media.file_id, cap_html)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
