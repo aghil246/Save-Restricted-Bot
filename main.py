@@ -129,12 +129,12 @@ def clean_markup(msg):
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-async def to_bin(sent):
+async def to_bin(sent, mk=None):
     """Copy a delivered message to the bin channel. Never raises."""
     if not BIN_CHANNEL or sent is None:
         return
     try:
-        await sent.copy(BIN_CHANNEL)
+        await sent.copy(BIN_CHANNEL, reply_markup=mk)  # sent msgs lack the markup, pass it explicitly
     except Exception as e:
         log.warning("bin channel copy failed: %s", e)
 
@@ -363,8 +363,9 @@ async def process_one(job, kind, ref, msg_id):
     if kind is None:
         try:
             orig = await bot.get_messages(chat, msg_id)
-            sent = await orig.copy(job.chat_id, reply_to_message_id=rid, reply_markup=clean_markup(orig))
-            await to_bin(sent)
+            mk = clean_markup(orig)
+            sent = await orig.copy(job.chat_id, reply_to_message_id=rid, reply_markup=mk)
+            await to_bin(sent, mk)
             return "copied"
         except (UsernameNotOccupied, UsernameInvalid):
             raise UserError("The username is not occupied by anyone")
@@ -389,7 +390,7 @@ async def process_one(job, kind, ref, msg_id):
         sent = await bot.send_message(job.chat_id, msg.text.html, parse_mode=ParseMode.HTML,
                                       disable_web_page_preview=True, reply_to_message_id=rid,
                                       reply_markup=clean_markup(msg))
-        await to_bin(sent)
+        await to_bin(sent, clean_markup(msg))
         return "downloaded"
 
     mkind = next((k for k in MEDIA_KINDS if getattr(msg, k, None)), None)
@@ -453,7 +454,7 @@ async def transfer(job, msg, mkind, chat_ref):
         if sent is None:  # upload was stopped
             raise StopTransmission
 
-        await to_bin(sent)
+        await to_bin(sent, mk)
         if extra:
             sent_extra = await bot.send_message(cid, extra, parse_mode=ParseMode.HTML, reply_to_message_id=sent.id)
             await to_bin(sent_extra)
