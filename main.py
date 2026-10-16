@@ -44,6 +44,7 @@ MAX_PER_USER = int(getenv("MAX_PER_USER", 3))  # queued+running jobs per user
 MAX_RANGE = int(getenv("MAX_RANGE", 100))    # max messages per "from-to" link
 DELAY = float(getenv("DELAY", 3))            # pause between account fetches
 DB_PATH = getenv("DB_PATH", "bot.db")
+BIN_CHANNEL = int(getenv("BIN_CHANNEL", 0))  # channel id (-100...) that receives a copy of everything sent
 
 db = DB(DB_PATH)
 if not OWNER:
@@ -116,6 +117,16 @@ busy = 0  # workers currently running a job
 
 def allowed(uid):
     return uid == OWNER or db.is_user(uid)
+
+
+async def to_bin(sent):
+    """Copy a delivered message to the bin channel. Never raises."""
+    if not BIN_CHANNEL or sent is None:
+        return
+    try:
+        await sent.copy(BIN_CHANNEL)
+    except Exception as e:
+        log.warning("bin channel copy failed: %s", e)
 
 
 def human(n):
@@ -333,14 +344,16 @@ async def process_one(job, kind, ref, msg_id):
     cached = db.cache_get(chat_ref, msg_id)
     if cached:
         ckind, file_id, cap = cached
-        await bot.send_cached_media(job.chat_id, file_id, caption=cap, parse_mode=ParseMode.HTML,
-                                    reply_to_message_id=rid)
+        sent = await bot.send_cached_media(job.chat_id, file_id, caption=cap, parse_mode=ParseMode.HTML,
+                                           reply_to_message_id=rid)
+        await to_bin(sent)
         return "cached"
 
     # public chats without protection: plain copy, no account needed
     if kind is None:
         try:
-            await bot.copy_message(job.chat_id, chat, msg_id, reply_to_message_id=rid)
+            sent = await bot.copy_message(job.chat_id, chat, msg_id, reply_to_message_id=rid)
+            await to_bin(sent)
             return "copied"
         except (UsernameNotOccupied, UsernameInvalid):
             raise UserError("The username is not occupied by anyone")
@@ -362,8 +375,9 @@ async def process_one(job, kind, ref, msg_id):
         raise UserError("Message not found or deleted")
 
     if msg.text:
-        await bot.send_message(job.chat_id, msg.text.html, parse_mode=ParseMode.HTML,
-                               disable_web_page_preview=True, reply_to_message_id=rid)
+        sent = await bot.send_message(job.chat_id, msg.text.html, parse_mode=ParseMode.HTML,
+                                      disable_web_page_preview=True, reply_to_message_id=rid)
+        await to_bin(sent)
         return "downloaded"
 
     mkind = next((k for k in MEDIA_KINDS if getattr(msg, k, None)), None)
@@ -425,8 +439,10 @@ async def transfer(job, msg, mkind, chat_ref):
         if sent is None:  # upload was stopped
             raise StopTransmission
 
+        await to_bin(sent)
         if extra:
-            await bot.send_message(cid, extra, parse_mode=ParseMode.HTML, reply_to_message_id=sent.id)
+            sent_extra = await bot.send_message(cid, extra, parse_mode=ParseMode.HTML, reply_to_message_id=sent.id)
+            await to_bin(sent_extra)
 
         sent_media = getattr(sent, mkind, None)
         if sent_media and not extra:  # long-caption posts need the follow-up message, so don't cache
@@ -437,6 +453,11 @@ async def transfer(job, msg, mkind, chat_ref):
 
 async def main():
     await bot.start()
+    if BIN_CHANNEL:
+        try:
+            await bot.get_chat(BIN_CHANNEL)
+        except Exception as e:
+            log.warning("BIN_CHANNEL %s not reachable (add the bot as channel admin): %s", BIN_CHANNEL, e)
     if acc:
         await acc.start()
     tasks = [asyncio.create_task(worker()) for _ in range(WORKERS)]
