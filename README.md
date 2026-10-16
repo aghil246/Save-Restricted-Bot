@@ -10,7 +10,7 @@
 - `ID` Your API ID from my.telegram.org
 - `TOKEN` Your bot token from @BotFather
 - `OWNER` Your Telegram user ID (admin; authorizes other users)
-- `BIN_CHANNEL` _(optional)_ Channel ID (`-100…`); add the bot as admin there. Each user chooses in `/settings` whether results are copied: Off (default), Always on, or Ask each time
+- `BIN_CHANNEL` _(optional)_ Default channel ID (`-100…`); the admin can also set/change it from the bot in `/settings` (overrides this); add the bot as admin there. Each user chooses in `/settings` whether results are copied: Off (default), Always on, or Ask each time
 - `STRING` Your session string, you can get it at [gist](https://gist.github.com/bipinkrish/0940b30ed66a5537ae1b5aaaee716897#file-main-py) and run it locally
 
 ---
