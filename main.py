@@ -46,8 +46,9 @@ DELAY = float(getenv("DELAY", 3))            # pause between account fetches
 DB_PATH = getenv("DB_PATH", "bot.db")
 
 db = DB(DB_PATH)
-if OWNER:
-    db.add_user(OWNER)
+if not OWNER:
+    raise SystemExit("OWNER is required (your Telegram user id)")
+db.add_user(OWNER)
 
 bot = Client("mybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, sleep_threshold=120)
 acc = (
@@ -110,6 +111,7 @@ class Job:
 
 queue: asyncio.Queue = asyncio.Queue()
 jobs_by_user: dict = {}
+busy = 0  # workers currently running a job
 
 
 def allowed(uid):
@@ -246,11 +248,12 @@ async def on_text(_, m):
     if len(jobs_by_user.get(uid, [])) >= MAX_PER_USER:
         return await m.reply(f"**Too many pending jobs** (max {MAX_PER_USER}). Use /cancel", quote=True)
 
+    ahead = queue.qsize() + busy
     job = Job(uid, m.chat.id, m.id, specs)
     jobs_by_user.setdefault(uid, []).append(job)
     await queue.put(job)
-    if queue.qsize() > 0:
-        await m.reply(f"__Queued (position {queue.qsize()})__", quote=True)
+    if ahead >= WORKERS:
+        await m.reply(f"__Queued (position {ahead - WORKERS + 1})__", quote=True)
 
 
 async def join(m, link):
@@ -271,12 +274,15 @@ async def join(m, link):
 async def worker():
     while True:
         job = await queue.get()
+        global busy
+        busy += 1
         try:
             if not job.cancelled:
                 await run_job(job)
         except Exception:
             log.exception("job crashed")
         finally:
+            busy -= 1
             jobs_by_user[job.user_id].remove(job)
             queue.task_done()
 
@@ -338,6 +344,8 @@ async def process_one(job, kind, ref, msg_id):
             return "copied"
         except (UsernameNotOccupied, UsernameInvalid):
             raise UserError("The username is not occupied by anyone")
+        except FloodWait:
+            raise
         except (RPCError, ValueError):
             pass  # restricted or private -> use the account
 
@@ -371,7 +379,9 @@ async def transfer(job, msg, mkind, chat_ref):
     try:
         path = await acc.download_media(msg, file_name=tmp + "/",
                                         progress=make_progress(acc, job, "Downloading"))
-        if path is None:
+        if path is None:  # pyrogram swallows all download errors, incl. StopTransmission
+            if job.cancelled:
+                raise StopTransmission
             raise UserError("Download failed")
 
         media = getattr(msg, mkind)
@@ -412,11 +422,14 @@ async def transfer(job, msg, mkind, chat_ref):
         else:
             sent = await bot.send_photo(cid, path, **cap, **base)
 
+        if sent is None:  # upload was stopped
+            raise StopTransmission
+
         if extra:
             await bot.send_message(cid, extra, parse_mode=ParseMode.HTML, reply_to_message_id=sent.id)
 
         sent_media = getattr(sent, mkind, None)
-        if sent_media:
+        if sent_media and not extra:  # long-caption posts need the follow-up message, so don't cache
             db.cache_put(chat_ref, msg.id, mkind, sent_media.file_id, cap_html)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
