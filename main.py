@@ -120,11 +120,12 @@ def allowed(uid):
 
 
 def clean_markup(msg):
-    """Keep only URL buttons of an inline keyboard (callback/other buttons can't work through this bot)."""
+    """Rebuild the inline keyboard: URL buttons stay links, every other button becomes a text-only "noop" button."""
     mk = getattr(msg, "reply_markup", None)
     if not isinstance(mk, InlineKeyboardMarkup):
         return None
-    rows = [[InlineKeyboardButton(b.text, url=b.url) for b in row if b.url] for row in mk.inline_keyboard]
+    rows = [[InlineKeyboardButton(b.text, url=b.url) if b.url else InlineKeyboardButton(b.text, callback_data="noop")
+             for b in row] for row in mk.inline_keyboard]
     rows = [r for r in rows if r]
     return InlineKeyboardMarkup(rows) if rows else None
 
@@ -180,6 +181,11 @@ async def start(_, m):
             [[InlineKeyboardButton("🌐 Source Code", url="https://github.com/aghil246/Save-Restricted-Bot")]]),
         quote=True,
     )
+
+
+@bot.on_callback_query(filters.regex("^noop$"))
+async def noop(_, q):
+    await q.answer("This button is not active in the copy.")
 
 
 @bot.on_message(filters.private & filters.command("cancel"))
