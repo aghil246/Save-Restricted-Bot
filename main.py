@@ -107,11 +107,13 @@ class Job:
     reply_id: int
     specs: list
     cancelled: bool = False
+    bin: bool = False
     status: object = field(default=None, repr=False)
 
 
 queue: asyncio.Queue = asyncio.Queue()
 jobs_by_user: dict = {}
+pending: dict = {}  # token -> (uid, chat_id, reply_id, specs, created) waiting for the BIN yes/no answer
 busy = 0  # workers currently running a job
 
 
@@ -130,9 +132,9 @@ def clean_markup(msg):
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-async def to_bin(sent, mk=None):
+async def to_bin(job, sent, mk=None):
     """Copy a delivered message to the bin channel. Never raises."""
-    if not BIN_CHANNEL or sent is None:
+    if not BIN_CHANNEL or not job.bin or sent is None:
         return
     try:
         await sent.copy(BIN_CHANNEL, reply_markup=mk)  # sent msgs lack the markup, pass it explicitly
@@ -275,12 +277,52 @@ async def on_text(_, m):
     if len(jobs_by_user.get(uid, [])) >= MAX_PER_USER:
         return await m.reply(f"**Too many pending jobs** (max {MAX_PER_USER}). Use /cancel", quote=True)
 
+    if BIN_CHANNEL:  # ask before queueing
+        now = time.monotonic()
+        for k in [k for k, v in pending.items() if now - v[4] > 600]:
+            del pending[k]
+        token = f"{m.chat.id}_{m.id}"
+        pending[token] = (uid, m.chat.id, m.id, specs, now)
+        return await m.reply(
+            "**Also send a copy to the BIN channel?**",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Yes", callback_data=f"bin:1:{token}"),
+                InlineKeyboardButton("❌ No", callback_data=f"bin:0:{token}"),
+            ]]),
+            quote=True,
+        )
+
+    note = await enqueue(uid, m.chat.id, m.id, specs, False)
+    if note:
+        await m.reply(note, quote=True)
+
+
+async def enqueue(uid, chat_id, reply_id, specs, use_bin):
+    """Queue a job. Returns a message to show the user (error or queue position), or None."""
+    if len(jobs_by_user.get(uid, [])) >= MAX_PER_USER:
+        return f"**Too many pending jobs** (max {MAX_PER_USER}). Use /cancel"
     ahead = queue.qsize() + busy
-    job = Job(uid, m.chat.id, m.id, specs)
+    job = Job(uid, chat_id, reply_id, specs, bin=use_bin)
     jobs_by_user.setdefault(uid, []).append(job)
     await queue.put(job)
     if ahead >= WORKERS:
-        await m.reply(f"__Queued (position {ahead - WORKERS + 1})__", quote=True)
+        return f"__Queued (position {ahead - WORKERS + 1})__"
+    return None
+
+
+@bot.on_callback_query(filters.regex(r"^bin:([01]):(.+)$"))
+async def on_bin_choice(_, q):
+    use_bin, token = q.matches[0].group(1) == "1", q.matches[0].group(2)
+    p = pending.get(token)
+    if not p:
+        return await q.answer("Expired, send the link again.", show_alert=True)
+    uid, chat_id, reply_id, specs, _ = p
+    if q.from_user.id != uid:
+        return await q.answer("Not your request.", show_alert=True)
+    del pending[token]
+    note = await enqueue(uid, chat_id, reply_id, specs, use_bin)
+    await q.message.edit_text(note or ("__Queued + BIN copy__" if use_bin else "__Queued__"))
+    await q.answer()
 
 
 async def join(m, link):
@@ -362,7 +404,7 @@ async def process_one(job, kind, ref, msg_id):
         ckind, file_id, cap = cached
         sent = await bot.send_cached_media(job.chat_id, file_id, caption=cap, parse_mode=ParseMode.HTML,
                                            reply_to_message_id=rid)
-        await to_bin(sent)
+        await to_bin(job, sent)
         return "cached"
 
     # public chats without protection: plain copy, no account needed
@@ -371,7 +413,7 @@ async def process_one(job, kind, ref, msg_id):
             orig = await bot.get_messages(chat, msg_id)
             mk = clean_markup(orig)
             sent = await orig.copy(job.chat_id, reply_to_message_id=rid, reply_markup=mk)
-            await to_bin(sent, mk)
+            await to_bin(job, sent, mk)
             return "copied"
         except (UsernameNotOccupied, UsernameInvalid):
             raise UserError("The username is not occupied by anyone")
@@ -396,7 +438,7 @@ async def process_one(job, kind, ref, msg_id):
         sent = await bot.send_message(job.chat_id, msg.text.html, parse_mode=ParseMode.HTML,
                                       disable_web_page_preview=True, reply_to_message_id=rid,
                                       reply_markup=clean_markup(msg))
-        await to_bin(sent, clean_markup(msg))
+        await to_bin(job, sent, clean_markup(msg))
         return "downloaded"
 
     mkind = next((k for k in MEDIA_KINDS if getattr(msg, k, None)), None)
@@ -460,10 +502,10 @@ async def transfer(job, msg, mkind, chat_ref):
         if sent is None:  # upload was stopped
             raise StopTransmission
 
-        await to_bin(sent, mk)
+        await to_bin(job, sent, mk)
         if extra:
             sent_extra = await bot.send_message(cid, extra, parse_mode=ParseMode.HTML, reply_to_message_id=sent.id)
-            await to_bin(sent_extra)
+            await to_bin(job, sent_extra)
 
         sent_media = getattr(sent, mkind, None)
         if sent_media and not extra and not mk:  # long captions / buttons aren't stored in the cache

@@ -10,7 +10,7 @@
 - `ID` Your API ID from my.telegram.org
 - `TOKEN` Your bot token from @BotFather
 - `OWNER` Your Telegram user ID (admin; authorizes other users)
-- `BIN_CHANNEL` _(optional)_ Channel ID (`-100…`) that receives a copy of every message the bot sends; add the bot as admin there
+- `BIN_CHANNEL` _(optional)_ Channel ID (`-100…`); when set, the bot asks Yes/No before each job whether to also copy the results there (add the bot as admin)
 - `STRING` Your session string, you can get it at [gist](https://gist.github.com/bipinkrish/0940b30ed66a5537ae1b5aaaee716897#file-main-py) and run it locally
 
 ---
