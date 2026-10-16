@@ -17,6 +17,11 @@ from pyrogram.errors import (
 )
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+try:  # newer Pyrogram forks (Kurigram etc.) deprecate reply_to_message_id / disable_web_page_preview
+    from pyrogram.types import LinkPreviewOptions, ReplyParameters
+except ImportError:
+    LinkPreviewOptions = ReplyParameters = None
+
 from db import DB
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -119,6 +124,19 @@ busy = 0  # workers currently running a job
 
 def allowed(uid):
     return uid == OWNER or db.is_user(uid)
+
+
+def rp(mid):
+    """Reply kwargs that work on classic Pyrogram 2.0.x and on forks that deprecate reply_to_message_id."""
+    if ReplyParameters:
+        return {"reply_parameters": ReplyParameters(message_id=mid)}
+    return {"reply_to_message_id": mid}
+
+
+def no_preview():
+    if LinkPreviewOptions:
+        return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+    return {"disable_web_page_preview": True}
 
 
 def clean_markup(msg):
@@ -357,10 +375,10 @@ async def worker():
 
 
 async def run_job(job):
-    job.status = await bot.send_message(job.chat_id, "__Working__", reply_to_message_id=job.reply_id)
+    job.status = await bot.send_message(job.chat_id, "__Working__", **rp(job.reply_id))
 
     async def say(text):
-        await bot.send_message(job.chat_id, text, reply_to_message_id=job.reply_id)
+        await bot.send_message(job.chat_id, text, **rp(job.reply_id))
 
     try:
         for kind, ref, first, last in job.specs:
@@ -403,7 +421,7 @@ async def process_one(job, kind, ref, msg_id):
     if cached:
         ckind, file_id, cap = cached
         sent = await bot.send_cached_media(job.chat_id, file_id, caption=cap, parse_mode=ParseMode.HTML,
-                                           reply_to_message_id=rid)
+                                           **rp(rid))
         await to_bin(job, sent)
         return "cached"
 
@@ -412,7 +430,7 @@ async def process_one(job, kind, ref, msg_id):
         try:
             orig = await bot.get_messages(chat, msg_id)
             mk = clean_markup(orig)
-            sent = await orig.copy(job.chat_id, reply_to_message_id=rid, reply_markup=mk)
+            sent = await orig.copy(job.chat_id, **rp(rid), reply_markup=mk)
             await to_bin(job, sent, mk)
             return "copied"
         except (UsernameNotOccupied, UsernameInvalid):
@@ -436,7 +454,7 @@ async def process_one(job, kind, ref, msg_id):
 
     if msg.text:
         sent = await bot.send_message(job.chat_id, msg.text.html, parse_mode=ParseMode.HTML,
-                                      disable_web_page_preview=True, reply_to_message_id=rid,
+                                      **no_preview(), **rp(rid),
                                       reply_markup=clean_markup(msg))
         await to_bin(job, sent, clean_markup(msg))
         return "downloaded"
@@ -474,7 +492,7 @@ async def transfer(job, msg, mkind, chat_ref):
             extra, cap_html = cap_html, None
         cap = dict(caption=cap_html, parse_mode=ParseMode.HTML)
         mk = clean_markup(msg)
-        base = dict(reply_to_message_id=job.reply_id, reply_markup=mk,
+        base = dict(**rp(job.reply_id), reply_markup=mk,
                     progress=make_progress(bot, job, "Uploading"))
         cid = job.chat_id
 
@@ -504,7 +522,7 @@ async def transfer(job, msg, mkind, chat_ref):
 
         await to_bin(job, sent, mk)
         if extra:
-            sent_extra = await bot.send_message(cid, extra, parse_mode=ParseMode.HTML, reply_to_message_id=sent.id)
+            sent_extra = await bot.send_message(cid, extra, parse_mode=ParseMode.HTML, **rp(sent.id))
             await to_bin(job, sent_extra)
 
         sent_media = getattr(sent, mkind, None)
