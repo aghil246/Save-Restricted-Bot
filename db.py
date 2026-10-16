@@ -20,6 +20,12 @@ class DB:
                 caption TEXT,
                 PRIMARY KEY (chat_ref, msg_id)
             );
+            CREATE TABLE IF NOT EXISTS settings (
+                user_id INTEGER NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (user_id, key)
+            );
             CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -46,6 +52,16 @@ class DB:
 
     def users(self):
         return [r[0] for r in self.conn.execute("SELECT id FROM users ORDER BY added_at")]
+
+    # per-user settings
+    def get_setting(self, uid, key, default=None):
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE user_id = ? AND key = ?", (uid, key)).fetchone()
+        return row[0] if row else default
+
+    def set_setting(self, uid, key, value):
+        self.conn.execute("INSERT OR REPLACE INTO settings VALUES (?, ?, ?)", (uid, key, value))
+        self.conn.commit()
 
     # file_id cache (resend without download/upload)
     def cache_get(self, chat_ref, msg_id):

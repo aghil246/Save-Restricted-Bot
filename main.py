@@ -15,7 +15,9 @@ from pyrogram.errors import (
     InviteHashInvalid, PeerIdInvalid, RPCError, UserAlreadyParticipant,
     UsernameInvalid, UsernameNotOccupied,
 )
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import (
+    BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup,
+)
 
 try:  # newer Pyrogram forks (Kurigram etc.) deprecate reply_to_message_id / disable_web_page_preview
     from pyrogram.types import LinkPreviewOptions, ReplyParameters
@@ -98,7 +100,7 @@ https://t.me/xxxx/1001-1010
 https://t.me/c/xxxx/101 - 120
 ```
 
-**COMMANDS**: /cancel — stop your running/queued jobs"""
+**COMMANDS**: /settings — options, /cancel — stop your running/queued jobs"""
 
 
 class UserError(Exception):
@@ -203,6 +205,47 @@ async def start(_, m):
     )
 
 
+# ---------- settings ----------
+BIN_LABELS = {"off": "Off", "on": "Always on", "ask": "Ask each time"}
+
+
+def settings_view(uid):
+    close = [InlineKeyboardButton("✖️ Close", callback_data="set:close")]
+    if not BIN_CHANNEL:
+        return "**⚙️ Settings**\n\n__Nothing to configure (BIN_CHANNEL is not set).__", InlineKeyboardMarkup([close])
+    cur = db.get_setting(uid, "bin", "off")
+    rows = [[InlineKeyboardButton(("✅ " if k == cur else "") + v, callback_data=f"set:bin:{k}")]
+            for k, v in BIN_LABELS.items()]
+    text = (f"**⚙️ Settings**\n\n**Copy to BIN channel**: {BIN_LABELS[cur]}\n"
+            "__Whether results are also copied to the BIN channel. \"Ask each time\" shows a Yes/No prompt per job.__")
+    return text, InlineKeyboardMarkup(rows + [close])
+
+
+@bot.on_message(filters.private & filters.command("settings"))
+async def settings(_, m):
+    if not allowed(m.from_user.id):
+        return await m.reply(f"**Not authorized.** Your ID: `{m.from_user.id}`", quote=True)
+    text, mk = settings_view(m.from_user.id)
+    await m.reply(text, reply_markup=mk, quote=True)
+
+
+@bot.on_callback_query(filters.regex(r"^set:(bin:(?:off|on|ask)|close)$"))
+async def on_settings(_, q):
+    if not allowed(q.from_user.id):
+        return await q.answer("Not authorized", show_alert=True)
+    data = q.matches[0].group(1)
+    if data == "close":
+        await q.answer()
+        return await q.message.delete()
+    db.set_setting(q.from_user.id, "bin", data.split(":")[1])
+    text, mk = settings_view(q.from_user.id)
+    try:
+        await q.message.edit_text(text, reply_markup=mk)
+    except RPCError:
+        pass  # message not modified
+    await q.answer("Saved")
+
+
 @bot.on_callback_query(filters.regex("^noop$"))
 async def noop(_, q):
     await q.answer("This button is not active in the copy.")
@@ -266,7 +309,7 @@ async def stats(_, m):
 
 
 # ---------- main text handler ----------
-CMDS = ["start", "cancel", "adduser", "deluser", "users", "stats"]
+CMDS = ["start", "settings", "cancel", "adduser", "deluser", "users", "stats"]
 
 
 @bot.on_message(filters.private & filters.text & ~filters.command(CMDS))
@@ -295,7 +338,8 @@ async def on_text(_, m):
     if len(jobs_by_user.get(uid, [])) >= MAX_PER_USER:
         return await m.reply(f"**Too many pending jobs** (max {MAX_PER_USER}). Use /cancel", quote=True)
 
-    if BIN_CHANNEL:  # ask before queueing
+    mode = db.get_setting(uid, "bin", "off") if BIN_CHANNEL else "off"
+    if mode == "ask":  # ask before queueing
         now = time.monotonic()
         for k in [k for k, v in pending.items() if now - v[4] > 600]:
             del pending[k]
@@ -310,7 +354,7 @@ async def on_text(_, m):
             quote=True,
         )
 
-    note = await enqueue(uid, m.chat.id, m.id, specs, False)
+    note = await enqueue(uid, m.chat.id, m.id, specs, mode == "on")
     if note:
         await m.reply(note, quote=True)
 
@@ -534,6 +578,20 @@ async def transfer(job, msg, mkind, chat_ref):
 
 async def main():
     await bot.start()
+    try:  # the "/" command menu
+        await bot.set_bot_commands([
+            BotCommand("start", "How to use the bot"),
+            BotCommand("settings", "Open settings"),
+            BotCommand("cancel", "Stop your running/queued jobs"),
+        ])
+        await bot.set_bot_commands(
+            [BotCommand("start", "How to use the bot"), BotCommand("settings", "Open settings"),
+             BotCommand("cancel", "Stop your running/queued jobs"), BotCommand("adduser", "Authorize a user"),
+             BotCommand("deluser", "Remove a user"), BotCommand("users", "List users"),
+             BotCommand("stats", "Bot statistics")],
+            scope=BotCommandScopeChat(OWNER))
+    except Exception as e:
+        log.warning("could not set bot commands: %s", e)
     if BIN_CHANNEL:
         try:
             await bot.get_chat(BIN_CHANNEL)

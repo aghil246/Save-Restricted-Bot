@@ -10,7 +10,7 @@
 - `ID` Your API ID from my.telegram.org
 - `TOKEN` Your bot token from @BotFather
 - `OWNER` Your Telegram user ID (admin; authorizes other users)
-- `BIN_CHANNEL` _(optional)_ Channel ID (`-100…`); when set, the bot asks Yes/No before each job whether to also copy the results there (add the bot as admin)
+- `BIN_CHANNEL` _(optional)_ Channel ID (`-100…`); add the bot as admin there. Each user chooses in `/settings` whether results are copied: Off (default), Always on, or Ask each time
 - `STRING` Your session string, you can get it at [gist](https://gist.github.com/bipinkrish/0940b30ed66a5537ae1b5aaaee716897#file-main-py) and run it locally
 
 ---
@@ -56,6 +56,7 @@ _note that space in between doesn't matter_
 _Only the owner and users added with `/adduser` can use the bot (data is stored in `bot.db`, SQLite)._
 
 - `/adduser <id>`, `/deluser <id>`, `/users`, `/stats` — owner only
+- `/settings` — per-user options (BIN channel copy mode)
 - `/cancel` — stop your running/queued jobs
 
 _Optional variables: `WORKERS` (2), `MAX_PER_USER` (3), `MAX_RANGE` (100), `DELAY` (3), `DB_PATH` (bot.db)_
