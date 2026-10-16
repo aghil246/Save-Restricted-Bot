@@ -1,0 +1,4 @@
+*.session
+*.session-journal
+bot.db*
+__pycache__/
